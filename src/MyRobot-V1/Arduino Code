@@ -1,133 +1,271 @@
-// MyRobot-V1.ino
-// This file must be named the same as your sketch folder
-/**
- * @file Motor.ino
- * @brief Simple H-bridge motor control helpers.
- *
- * Provides a minimal interface for driving a DC motor using
- * digital GPIO pins (e.g. Arduino-style platforms).
- *
- * The motor direction is controlled via two input pins,
- * while a separate enable pin turns the motor on or off.
- *
- * @author Paul Bucci
- * @date 2026
- */
 
-// ---------- Pins: match these to YOUR wiring. Enable pins must be PWM (~) pins. ----------
+ // MyRobot-V1.ino
+
+// ---------- Motor pins ----------
 const int LEFT_IN1  = 2;
 const int LEFT_IN2  = 3;
-const int LEFT_EN   = 9;    // PWM
+const int LEFT_EN   = 9;
 
 const int RIGHT_IN1 = 4;
 const int RIGHT_IN2 = 5;
-const int RIGHT_EN  = 10;   // PWM
+const int RIGHT_EN  = 10;
 
-// ---------- Speeds (0-255): starting values, then tune ----------
+// ---------- Ultrasonic sensor pins ----------
+const int TRIG_PIN = 6;
+const int ECHO_PIN = 7;
+
+// ---------- Motor settings ----------
 const int MIN_SPEED  = 90;
 const int BASE_SPEED = 180;
 const int TURN_DIFF  = 80;
 
-// ---------- Wheel direction: flip to -1 if that wheel spins backwards on forward() ----------
 const int LEFT_DIR  = 1;
 const int RIGHT_DIR = 1;
 
-// Current speed used by serial commands (changed with + and -)
 int speedSetting = BASE_SPEED;
 
+// ---------- P-controller settings ----------
+const float SET_POINT = 25.0;  // Target distance (cm)
+const float KP = 8.0;          // Proportional gain
+const float TOLERANCE = 2.0;   // Stop within +/- 2 cm
 
-// ---------- Original single-motor helpers ----------
-/**
- * @brief Drives a DC motor in a fixed direction using an H-bridge.
- *
- * @param in1 GPIO pin connected to motor driver input 1 (direction control)
- * @param in2 GPIO pin connected to motor driver input 2 (direction control)
- * @param enA GPIO pin connected to motor driver enable pin (motor on/off)
- */
-void drive(int in1, int in2, int enA) {
-    digitalWrite(in1, LOW);   // Direction control: IN1
-    digitalWrite(in2, HIGH);  // Direction control: IN2 (sets rotation direction)
-    digitalWrite(enA, HIGH);  // Enable motor driver
-}
+bool followMode = false;
 
-void stop(int in1, int in2, int enA) {
+// ---------- Motor functions ----------
+void setMotor(int in1, int in2, int en, int speed) {
+  speed = constrain(speed, -255, 255);
+
+  if (speed > 0) {
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, HIGH);
+  }
+  else if (speed < 0) {
+    digitalWrite(in1, HIGH);
+    digitalWrite(in2, LOW);
+  }
+  else {
     digitalWrite(in1, LOW);
     digitalWrite(in2, LOW);
-    digitalWrite(enA, LOW);   // Disable motor driver
-}
+  }
 
-
-// ---------- Driving functions ----------
-void setMotor(int in1, int in2, int en, int speed) {
-    speed = constrain(speed, -255, 255);
-    if (speed > 0)      { digitalWrite(in1, LOW);  digitalWrite(in2, HIGH); }
-    else if (speed < 0) { digitalWrite(in1, HIGH); digitalWrite(in2, LOW);  }
-    else                { digitalWrite(in1, LOW);  digitalWrite(in2, LOW);  }
-    analogWrite(en, abs(speed));
+  analogWrite(en, abs(speed));
 }
 
 void setWheels(int left, int right) {
-    setMotor(LEFT_IN1,  LEFT_IN2,  LEFT_EN,  left  * LEFT_DIR);
-    setMotor(RIGHT_IN1, RIGHT_IN2, RIGHT_EN, right * RIGHT_DIR);
+  setMotor(LEFT_IN1, LEFT_IN2, LEFT_EN,
+           left * LEFT_DIR);
+
+  setMotor(RIGHT_IN1, RIGHT_IN2, RIGHT_EN,
+           right * RIGHT_DIR);
 }
 
-void forward(int speed = BASE_SPEED)  { setWheels( speed,  speed); }
-void backward(int speed = BASE_SPEED) { setWheels(-speed, -speed); }
-
-void turnLeft(int speed = BASE_SPEED, int diff = TURN_DIFF) {
-    setWheels(max(speed - diff, MIN_SPEED), speed);
-}
-void turnRight(int speed = BASE_SPEED, int diff = TURN_DIFF) {
-    setWheels(speed, max(speed - diff, MIN_SPEED));
+void forward(int speed = BASE_SPEED) {
+  setWheels(speed, speed);
 }
 
-void spinLeft(int speed = BASE_SPEED)  { setWheels(-speed,  speed); }
-void spinRight(int speed = BASE_SPEED) { setWheels( speed, -speed); }
-
-void stopRobot() { setWheels(0, 0); }
-
-
-// ---------- Serial command handling ----------
-void handleCommand(char c) {
-    switch (c) {
-        case 'w': forward(speedSetting);   break;
-        case 's': backward(speedSetting);  break;
-        case 'a': turnLeft(speedSetting);  break;
-        case 'd': turnRight(speedSetting); break;
-        case 'q': spinLeft(speedSetting);  break;
-        case 'e': spinRight(speedSetting); break;
-        case ' ': stopRobot();             break;
-        case '+': speedSetting = min(speedSetting + 10, 255); break;
-        case '-': speedSetting = max(speedSetting - 10, 0);   break;
-    }
-    Serial.print("cmd: ");
-    Serial.print(c);
-    Serial.print("  speed: ");
-    Serial.println(speedSetting);
+void backward(int speed = BASE_SPEED) {
+  setWheels(-speed, -speed);
 }
 
+void turnLeft(int speed = BASE_SPEED,
+              int diff = TURN_DIFF) {
+  setWheels(max(speed - diff, MIN_SPEED), speed);
+}
 
-// ---------- Arduino entry points ----------
-void setup() {
-    Serial.begin(9600);
+void turnRight(int speed = BASE_SPEED,
+               int diff = TURN_DIFF) {
+  setWheels(speed, max(speed - diff, MIN_SPEED));
+}
 
-    // Set motor control pins as outputs
-    pinMode(LEFT_EN, OUTPUT);
-    pinMode(LEFT_IN1, OUTPUT);
-    pinMode(LEFT_IN2, OUTPUT);
+void spinLeft(int speed = BASE_SPEED) {
+  setWheels(-speed, speed);
+}
 
-    pinMode(RIGHT_EN, OUTPUT);
-    pinMode(RIGHT_IN1, OUTPUT);
-    pinMode(RIGHT_IN2, OUTPUT);
+void spinRight(int speed = BASE_SPEED) {
+  setWheels(speed, -speed);
+}
 
+void stopRobot() {
+  setWheels(0, 0);
+}
+
+// ---------- Ultrasonic sensor ----------
+float measureDistance() {
+
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+
+  // No echo detected
+  if (duration == 0) {
+    return -1;
+  }
+
+  // Convert echo time to cm
+  float distance = duration * 0.0343 / 2.0;
+
+  return distance;
+}
+
+// ---------- P-controller ----------
+void followObject() {
+
+  float distance = measureDistance();
+
+  // Stop if measurement is invalid
+  if (distance < 0 || distance > 200) {
     stopRobot();
-    Serial.println("Ready. w/s/a/d/q/e = move, space = stop, +/- = speed");
+    Serial.println("No valid object detected");
+    return;
+  }
+
+  // Calculate error
+  float error = distance - SET_POINT;
+
+  // Calculate proportional output
+  float output = KP * error;
+
+  // Convert output to motor PWM range
+  int motorSpeed = constrain(
+    (int)abs(output), 0, 255
+  );
+
+  // Stop when close enough
+  if (abs(error) <= TOLERANCE) {
+    stopRobot();
+    motorSpeed = 0;
+  }
+
+  // Object is too far away
+  else if (error > 0) {
+    motorSpeed = max(motorSpeed, MIN_SPEED);
+    forward(motorSpeed);
+  }
+
+  // Object is too close
+  else {
+    motorSpeed = max(motorSpeed, MIN_SPEED);
+    backward(motorSpeed);
+  }
+
+  // Print controller information
+  Serial.print("Distance: ");
+  Serial.print(distance);
+
+  Serial.print(" cm | Error: ");
+  Serial.print(error);
+
+  Serial.print(" | Output: ");
+  Serial.print(output);
+
+  Serial.print(" | Motor speed: ");
+  Serial.println(motorSpeed);
 }
 
+// ---------- Serial commands ----------
+void handleCommand(char c) {
+
+  // Space always stops the robot
+  if (c == ' ') {
+    followMode = false;
+    stopRobot();
+    Serial.println("STOPPED");
+    return;
+  }
+
+  // Activate automatic mode
+  if (c == 'f') {
+    followMode = true;
+    stopRobot();
+    Serial.println("Follow Me mode ON");
+    return;
+  }
+
+  // Return to manual mode
+  if (c == 'm') {
+    followMode = false;
+    stopRobot();
+    Serial.println("Manual mode ON");
+    return;
+  }
+
+  // Ignore movement commands during auto mode
+  if (followMode) {
+    Serial.println("Press m for manual mode");
+    return;
+  }
+
+  switch (c) {
+    case 'w': forward(speedSetting); break;
+    case 's': backward(speedSetting); break;
+    case 'a': turnLeft(speedSetting); break;
+    case 'd': turnRight(speedSetting); break;
+    case 'q': spinLeft(speedSetting); break;
+    case 'e': spinRight(speedSetting); break;
+
+    case '+':
+      speedSetting = min(speedSetting + 10, 255);
+      break;
+
+    case '-':
+      speedSetting = max(speedSetting - 10, 0);
+      break;
+  }
+
+  Serial.print("Command: ");
+  Serial.print(c);
+  Serial.print(" | Speed: ");
+  Serial.println(speedSetting);
+}
+
+// ---------- Setup ----------
+void setup() {
+
+  Serial.begin(9600);
+
+  // Motor pins
+  pinMode(LEFT_EN, OUTPUT);
+  pinMode(LEFT_IN1, OUTPUT);
+  pinMode(LEFT_IN2, OUTPUT);
+
+  pinMode(RIGHT_EN, OUTPUT);
+  pinMode(RIGHT_IN1, OUTPUT);
+  pinMode(RIGHT_IN2, OUTPUT);
+
+  // Sensor pins
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  stopRobot();
+
+  Serial.println("Robot ready!");
+  Serial.println("f = Follow Me mode");
+  Serial.println("m = Manual mode");
+  Serial.println("space = Stop");
+  Serial.println("w/s/a/d/q/e = Movement");
+}
+
+// ---------- Main loop ----------
 void loop() {
-    if (Serial.available() > 0) {
-        char c = Serial.read();
-        if (c == '\n' || c == '\r') return;   // ignore Enter
-        handleCommand(c);
+
+  // Read serial commands
+  if (Serial.available() > 0) {
+    char c = Serial.read();
+
+    if (c != '\n' && c != '\r') {
+      handleCommand(c);
     }
+  }
+
+  // Run automatic P-controller
+  if (followMode) {
+    followObject();
+    delay(100);
+  }
 }
