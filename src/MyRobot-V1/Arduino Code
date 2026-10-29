@@ -1,162 +1,287 @@
-// MyRobot-V2.ino
-// Fixed version with full PID controller
-// Fixes applied:
-//   1. MIN_SPEED floor no longer breaks the PID controller
-//   2. Turn functions no longer reverse at low speeds
-//   3. Non-blocking timing with millis() instead of delay(100)
-//   4. Median-of-3 filter on ultrasonic sensor
-//   5. Manual mode auto-stops after 200ms of no commands
-//   6. Full PID controller implemented with anti-windup
+// MyRobot-V4.ino
+// Wall-following robot with dual encoders and dual ultrasonic sensors
+//
+// Sensor placement:
+//   - FRONT sensor: faces forward, detects obstacles ahead
+//   - LEFT sensor:  faces left, maintains distance from wall
+//
+// Behavior:
+//   - Wall-following mode ('f'): Robot drives forward, maintains a fixed
+//     distance from the left wall using the left sensor. If the front
+//     sensor detects an obstacle, the robot spins right to avoid it.
+//   - Manual mode ('m'): WASD/QE control with encoder-based straight-line correction.
+//
+// Pin assignments:
+//   - Front ultrasonic: TRIG=11, ECHO=12 (was "left" sensor pins in V3)
+//   - Left ultrasonic:  TRIG=6,  ECHO=13 (was "right" sensor pins in V3)
+//   - Encoders: pins 2, 3 (interrupts)
+//   - Motors: pins 4, 5, 9 (left) and 7, 8, 10 (right)
+//
+// Encoder assumption: single-channel encoders that count up regardless
+// of direction. Motor direction is tracked separately to derive signed
+// speed.
 
-// ---------- Motor pins ----------
-const int LEFT_IN1  = 2;
-const int LEFT_IN2  = 3;
-const int LEFT_EN   = 9;
+// =====================================================================
+// PIN ASSIGNMENTS
+// =====================================================================
+// Motors (pins 2 & 3 freed for encoder interrupts)
+const int LEFT_IN1  = 4;
+const int LEFT_IN2  = 5;
+const int LEFT_EN   = 9;    // PWM pin
 
-const int RIGHT_IN1 = 4;
-const int RIGHT_IN2 = 5;
-const int RIGHT_EN  = 10;
+const int RIGHT_IN1 = 7;
+const int RIGHT_IN2 = 8;
+const int RIGHT_EN  = 10;   // PWM pin
 
-// ---------- Ultrasonic sensor pins ----------
-const int TRIG_PIN = 6;
-const int ECHO_PIN = 7;
+// Wheel encoders (MUST be on interrupt-capable pins: 2 & 3 on Uno)
+const int LEFT_ENCODER_PIN  = 2;   // INT0
+const int RIGHT_ENCODER_PIN = 3;   // INT1
 
-// ---------- Motor settings ----------
-const int MIN_SPEED  = 90;   // Below this PWM, motors stall
+// Dual ultrasonic sensors
+// Front sensor: faces forward, detects obstacles
+// Left sensor:  faces left, maintains wall distance
+const int FRONT_TRIG = 11;   // Was LEFT_TRIG in V3
+const int FRONT_ECHO = 12;   // Was LEFT_ECHO in V3
+const int LEFT_TRIG  = 6;    // Was RIGHT_TRIG in V3
+const int LEFT_ECHO  = 13;   // Was RIGHT_ECHO in V3
+
+// =====================================================================
+// ENCODER SPECS — adjust to your hardware
+// =====================================================================
+const int PULSES_PER_REV = 20;
+const float WHEEL_DIAMETER_CM = 6.5;
+const float WHEEL_CIRCUMFERENCE = PI * WHEEL_DIAMETER_CM;
+const float CM_PER_PULSE = WHEEL_CIRCUMFERENCE / PULSES_PER_REV;
+
+// =====================================================================
+// ENCODER STATE (volatile = modified inside ISR)
+// =====================================================================
+volatile int leftEncoderCount = 0;
+volatile int rightEncoderCount = 0;
+
+int leftMotorDir = 0;
+int rightMotorDir = 0;
+
+int lastLeftCount = 0;
+int lastRightCount = 0;
+float leftSpeedpps = 0.0;
+float rightSpeedpps = 0.0;
+float leftSpeedCm = 0.0;
+float rightSpeedCm = 0.0;
+
+// =====================================================================
+// MOTOR SETTINGS
+// =====================================================================
+const int MIN_SPEED  = 90;
 const int BASE_SPEED = 180;
 const int TURN_DIFF  = 80;
-
 const int LEFT_DIR  = 1;
 const int RIGHT_DIR = 1;
-
 int speedSetting = BASE_SPEED;
 
-// ---------- PID controller settings ----------
-const float SET_POINT  = 25.0;   // Target distance (cm)
-const float KP = 8.0;            // Proportional gain
-const float KI = 0.5;            // Integral gain (NEW)
-const float KD = 1.5;            // Derivative gain (NEW)
-const float TOLERANCE = 2.0;     // Deadband: stop within +/- 2 cm
+// =====================================================================
+// WALL-FOLLOWING PID (uses left sensor)
+// =====================================================================
+// Maintains a fixed distance from the wall on the left side.
+// Error = leftDistance - WALL_SET_POINT
+//   - error > 0 (too far from wall) → steer left → left slower, right faster
+//   - error < 0 (too close to wall) → steer right → left faster, right slower
+const float WALL_SET_POINT = 15.0;     // Target distance from left wall (cm)
+const float KP_WALL = 4.0;             // Proportional gain
+const float KI_WALL = 0.2;             // Integral gain
+const float KD_WALL = 0.8;             // Derivative gain
+const float WALL_TOLERANCE = 2.0;     // Deadband: ±2 cm
+const float WALL_INTEGRAL_MAX = 100.0;
 
-// PID state variables (NEW)
-float integral       = 0.0;
-float lastError      = 0.0;
-unsigned long lastPidTime = 0;   // Timestamp for dt calculation
+float wallIntegral = 0.0;
+float lastWallError = 0.0;
 
-// Anti-windup limits (NEW)
-const float INTEGRAL_MAX = 200.0;
-const float INTEGRAL_MIN = -200.0;
+// =====================================================================
+// FRONT OBSTACLE DETECTION
+// =====================================================================
+// If the front sensor detects something closer than this, the robot
+// spins right to avoid it instead of following the wall.
+const float FRONT_THRESHOLD = 15.0;   // cm
 
-bool followMode = false;
+// =====================================================================
+// SPEED PID (inner loop, per wheel)
+// =====================================================================
+const float KP_SPEED = 0.8;
+const float KI_SPEED = 0.2;
+const float KD_SPEED = 0.1;
+const float SPEED_INTEGRAL_MAX = 150.0;
 
-// ---------- Timing for non-blocking loop (NEW) ----------
+float leftSpeedIntegral = 0.0;
+float rightSpeedIntegral = 0.0;
+float lastLeftSpeedError = 0.0;
+float lastRightSpeedError = 0.0;
+
+float targetLeftSpeed = 0.0;
+float targetRightSpeed = 0.0;
+
+int leftPWM = 0;
+int rightPWM = 0;
+
+// =====================================================================
+// MODE & TIMING
+// =====================================================================
+bool wallFollowMode = false;
 unsigned long lastFollowTime = 0;
-const unsigned long FOLLOW_INTERVAL = 100;  // ms between PID updates
-
-// ---------- Manual mode auto-stop (NEW) ----------
+const unsigned long FOLLOW_INTERVAL = 100;      // ms between PID updates
+unsigned long lastPidTime = 0;
 unsigned long lastCommandTime = 0;
-const unsigned long MANUAL_TIMEOUT = 200;   // ms before auto-stop
+const unsigned long MANUAL_TIMEOUT = 200;       // ms before auto-stop
+unsigned long lastSpeedCalcTime = 0;
+const unsigned long SPEED_CALC_INTERVAL = 50;   // ms between speed samples
 
-// ---------- Motor functions ----------
+const float STRAIGHT_CORRECTION_GAIN = 0.3;
+
+// Wall-following base speed (in pulses/sec)
+// Adjust based on your encoder resolution and desired speed
+const float WALL_FOLLOW_BASE_SPEED_PPS = 30.0;
+
+// Spin speed when avoiding front obstacle (pulses/sec)
+const float OBSTACLE_SPIN_SPEED_PPS = 25.0;
+
+// =====================================================================
+// ENCODER INTERRUPT SERVICE ROUTINES
+// =====================================================================
+void leftEncoderISR() {
+  leftEncoderCount++;
+}
+
+void rightEncoderISR() {
+  rightEncoderCount++;
+}
+
+// =====================================================================
+// MOTOR FUNCTIONS
+// =====================================================================
 void setMotor(int in1, int in2, int en, int speed) {
   speed = constrain(speed, -255, 255);
-
   if (speed > 0) {
     digitalWrite(in1, LOW);
     digitalWrite(in2, HIGH);
-  }
-  else if (speed < 0) {
+  } else if (speed < 0) {
     digitalWrite(in1, HIGH);
     digitalWrite(in2, LOW);
-  }
-  else {
+  } else {
     digitalWrite(in1, LOW);
     digitalWrite(in2, LOW);
   }
-
   analogWrite(en, abs(speed));
 }
 
 void setWheels(int left, int right) {
-  setMotor(LEFT_IN1, LEFT_IN2, LEFT_EN,  left  * LEFT_DIR);
+  leftMotorDir = (left > 0) ? 1 : (left < 0) ? -1 : 0;
+  rightMotorDir = (right > 0) ? 1 : (right < 0) ? -1 : 0;
+  setMotor(LEFT_IN1, LEFT_IN2, LEFT_EN, left * LEFT_DIR);
   setMotor(RIGHT_IN1, RIGHT_IN2, RIGHT_EN, right * RIGHT_DIR);
 }
 
-void forward(int speed = BASE_SPEED) {
-  setWheels(speed, speed);
-}
+void forward(int speed = BASE_SPEED) { setWheels(speed, speed); }
+void backward(int speed = BASE_SPEED) { setWheels(-speed, -speed); }
 
-void backward(int speed = BASE_SPEED) {
-  setWheels(-speed, -speed);
-}
-
-// FIX #2: Removed the MIN_SPEED floor that could reverse the turn direction.
-// Now we just clamp the slow wheel to >= 0 so it never goes negative
-// (which would reverse it). The robot will turn less sharply at low speeds
-// rather than turning the wrong way.
 void turnLeft(int speed = BASE_SPEED, int diff = TURN_DIFF) {
-  int slowWheel = max(speed - diff, 0);   // Clamp at 0, not MIN_SPEED
+  int slowWheel = max(speed - diff, 0);
   setWheels(slowWheel, speed);
 }
 
 void turnRight(int speed = BASE_SPEED, int diff = TURN_DIFF) {
-  int slowWheel = max(speed - diff, 0);   // Clamp at 0, not MIN_SPEED
+  int slowWheel = max(speed - diff, 0);
   setWheels(speed, slowWheel);
 }
 
-void spinLeft(int speed = BASE_SPEED) {
-  setWheels(-speed, speed);
-}
-
-void spinRight(int speed = BASE_SPEED) {
-  setWheels(speed, -speed);
-}
+void spinLeft(int speed = BASE_SPEED) { setWheels(-speed, speed); }
+void spinRight(int speed = BASE_SPEED) { setWheels(speed, -speed); }
 
 void stopRobot() {
   setWheels(0, 0);
+  wallIntegral = 0.0;
+  lastWallError = 0.0;
+  leftSpeedIntegral = 0.0;
+  rightSpeedIntegral = 0.0;
+  lastLeftSpeedError = 0.0;
+  lastRightSpeedError = 0.0;
+  targetLeftSpeed = 0.0;
+  targetRightSpeed = 0.0;
+  leftPWM = 0;
+  rightPWM = 0;
 }
 
-// ---------- Ultrasonic sensor ----------
+// =====================================================================
+// ENCODER SPEED CALCULATION
+// =====================================================================
+void updateEncoderSpeeds() {
+  unsigned long now = millis();
+  float dt = (now - lastSpeedCalcTime) / 1000.0;
+  lastSpeedCalcTime = now;
+  if (dt <= 0.0) dt = 0.05;
 
-// FIX #4: Added median-of-3 filter to reject noisy readings.
-// Takes 3 measurements and returns the middle value, which ignores
-// one bad outlier reading without slowing down the loop much.
-float measureDistanceRaw() {
-  digitalWrite(TRIG_PIN, LOW);
+  noInterrupts();
+  int currentLeft = leftEncoderCount;
+  int currentRight = rightEncoderCount;
+  interrupts();
+
+  leftSpeedpps = (currentLeft - lastLeftCount) / dt;
+  rightSpeedpps = (currentRight - lastRightCount) / dt;
+
+  leftSpeedCm = leftSpeedpps * CM_PER_PULSE * leftMotorDir;
+  rightSpeedCm = rightSpeedpps * CM_PER_PULSE * rightMotorDir;
+
+  lastLeftCount = currentLeft;
+  lastRightCount = currentRight;
+}
+
+// =====================================================================
+// SPEED PID (inner loop, per wheel)
+// =====================================================================
+float speedPID(float targetSpeed, float actualSpeed,
+               float &integral, float &lastError, float dt) {
+  float error = targetSpeed - actualSpeed;
+  float pTerm = KP_SPEED * error;
+  integral += error * dt;
+  integral = constrain(integral, -SPEED_INTEGRAL_MAX, SPEED_INTEGRAL_MAX);
+  float iTerm = KI_SPEED * integral;
+  float derivative = (error - lastError) / dt;
+  float dTerm = KD_SPEED * derivative;
+  lastError = error;
+  return pTerm + iTerm + dTerm;
+}
+
+// =====================================================================
+// ULTRASONIC SENSOR (with median-of-3 filter)
+// =====================================================================
+float measureDistanceRaw(int trigPin, int echoPin) {
+  digitalWrite(trigPin, LOW);
   delayMicroseconds(2);
-  digitalWrite(TRIG_PIN, HIGH);
+  digitalWrite(trigPin, HIGH);
   delayMicroseconds(10);
-  digitalWrite(TRIG_PIN, LOW);
-
-  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
-
+  digitalWrite(trigPin, LOW);
+  long duration = pulseIn(echoPin, HIGH, 30000);
   if (duration == 0) return -1.0;
   return duration * 0.0343 / 2.0;
 }
 
 float medianOf3(float a, float b, float c) {
   float arr[3] = {a, b, c};
-  // Simple bubble sort for 3 elements
   if (arr[0] > arr[1]) { float t = arr[0]; arr[0] = arr[1]; arr[1] = t; }
   if (arr[1] > arr[2]) { float t = arr[1]; arr[1] = arr[2]; arr[2] = t; }
   if (arr[0] > arr[1]) { float t = arr[0]; arr[0] = arr[1]; arr[1] = t; }
   return arr[1];
 }
 
-float measureDistance() {
-  float d1 = measureDistanceRaw();
-  float d2 = measureDistanceRaw();
-  float d3 = measureDistanceRaw();
+float measureDistance(int trigPin, int echoPin) {
+  float d1 = measureDistanceRaw(trigPin, echoPin);
+  float d2 = measureDistanceRaw(trigPin, echoPin);
+  float d3 = measureDistanceRaw(trigPin, echoPin);
 
-  // If any reading is invalid, return the first valid one
-  // (or -1 if all are invalid)
   int validCount = 0;
-  float validSum = 0;
   float validReadings[3];
+  float readings[3] = {d1, d2, d3};
   for (int i = 0; i < 3; i++) {
-    float d = (i == 0) ? d1 : (i == 1) ? d2 : d3;
-    if (d > 0 && d < 200) {
-      validReadings[validCount] = d;
+    if (readings[i] > 0 && readings[i] < 200) {
+      validReadings[validCount] = readings[i];
       validCount++;
     }
   }
@@ -166,146 +291,208 @@ float measureDistance() {
   return medianOf3(d1, d2, d3);
 }
 
-// ---------- PID controller ----------
-// FIX #1 & #6: Full PID implementation.
-// - Proportional: reacts to current error
-// - Integral:     eliminates steady-state offset (accumulates past error)
-// - Derivative:   damps oscillation by reacting to rate of change of error
-// - Anti-windup:  clamps the integral term so it doesn't blow up
-// - Deadband:     stops the robot when error is within TOLERANCE
-//                instead of forcing MIN_SPEED (which caused oscillation)
-// - MIN_SPEED:   only applied as a "kickstart" when the PID output
-//                is nonzero but too small to move the motors
-void followObject() {
+// =====================================================================
+// WALL-FOLLOWING MODE
+// =====================================================================
+// Architecture:
+//
+//   Left Sensor → Wall PID → Steering Correction
+//                                │
+//   Base Speed ──────────→ ┌── Left Target Speed
+//                          │
+//                          └── Right Target Speed
+//                                 │           │
+//                                 ↓           ↓
+//   Left Encoder → Left Speed PID → Left PWM
+//   Right Encoder → Right Speed PID → Right PWM
+//
+//   Front Sensor → Obstacle Detection → Spin Right override
+//
+// Logic:
+//   1. Read front sensor. If obstacle < FRONT_THRESHOLD, spin right.
+//   2. Otherwise, read left sensor and run wall PID.
+//   3. Wall PID output = steering correction.
+//   4. Target speeds = base speed ± steering correction.
+//   5. Speed PID on each wheel matches target using encoder feedback.
+//
+// Steering direction:
+//   - Too far from wall (error > 0) → steer left → left slower, right faster
+//   - Too close to wall (error < 0) → steer right → left faster, right slower
+void wallFollow() {
 
-  float distance = measureDistance();
+  // --- Step 1: Read both sensors ---
+  float frontDist = measureDistance(FRONT_TRIG, FRONT_ECHO);
+  float leftDist  = measureDistance(LEFT_TRIG, LEFT_ECHO);
 
-  if (distance < 0 || distance > 200) {
-    stopRobot();
-    Serial.println("No valid object detected");
-    return;
-  }
-
-  // Calculate dt in seconds (needed for integral and derivative)
+  // --- Step 2: Calculate dt (shared by all PIDs) ---
   unsigned long now = millis();
   float dt = (now - lastPidTime) / 1000.0;
   lastPidTime = now;
-
-  // Avoid division by zero on first iteration
   if (dt <= 0.0) dt = 0.1;
 
-  // Calculate error
-  float error = distance - SET_POINT;
+  // --- Step 3: Check for front obstacle ---
+  // If something is close in front, spin right to avoid it.
+  // This overrides wall-following.
+  if (frontDist > 0 && frontDist < FRONT_THRESHOLD) {
+    // Spin right: left wheel forward, right wheel backward
+    targetLeftSpeed = OBSTACLE_SPIN_SPEED_PPS;
+    targetRightSpeed = -OBSTACLE_SPIN_SPEED_PPS;
 
-  // --- P term ---
-  float pTerm = KP * error;
+    // Reset wall PID state during obstacle avoidance
+    wallIntegral = 0.0;
+    lastWallError = 0.0;
 
-  // --- I term (NEW) ---
-  // Accumulate error over time, but only when not in deadband
-  // (prevents integral windup while sitting still in tolerance)
-  if (abs(error) > TOLERANCE) {
-    integral += error * dt;
-  }
-  // Anti-windup: clamp the integral term
-  integral = constrain(integral, INTEGRAL_MIN, INTEGRAL_MAX);
-  float iTerm = KI * integral;
-
-  // --- D term (NEW) ---
-  // Rate of change of error. Negative when approaching setpoint (damping).
-  float derivative = (error - lastError) / dt;
-  float dTerm = KD * derivative;
-  lastError = error;
-
-  // --- Total PID output ---
-  float output = pTerm + iTerm + dTerm;
-
-  // Convert to motor PWM range
-  int motorSpeed = constrain((int)abs(output), 0, 255);
-
-  // --- Deadband: stop if close enough ---
-  // FIX #1: No more MIN_SPEED floor inside the deadband.
-  // The robot simply stops. This prevents the bang-bang oscillation
-  // that the original code caused.
-  if (abs(error) <= TOLERANCE) {
-    stopRobot();
-    // Reset integral when settled to prevent windup from lingering
-    integral = 0.0;
-    motorSpeed = 0;
+    Serial.print("OBSTACLE! Front: ");
+    Serial.print(frontDist);
+    Serial.println(" cm | Spinning right");
   }
 
-  // --- Object too far: drive forward ---
-  else if (error > 0) {
-    // FIX #1: Only apply MIN_SPEED as a kickstart if PID says to move
-    // but the value is too small to overcome motor stiction.
-    // This avoids the "jump to 90 PWM" lunge that caused oscillation.
-    if (motorSpeed > 0 && motorSpeed < MIN_SPEED) {
-      motorSpeed = MIN_SPEED;
-    }
-    forward(motorSpeed);
-  }
-
-  // --- Object too close: drive backward ---
+  // --- Step 4: No front obstacle → follow wall ---
   else {
-    if (motorSpeed > 0 && motorSpeed < MIN_SPEED) {
-      motorSpeed = MIN_SPEED;
+    float steerCorrection = 0.0;
+
+    if (leftDist > 0 && leftDist < 200) {
+      // Wall is visible — run wall PID
+      float wallError = leftDist - WALL_SET_POINT;
+
+      // P term
+      float pTerm = KP_WALL * wallError;
+
+      // I term with anti-windup (only accumulate outside deadband)
+      if (abs(wallError) > WALL_TOLERANCE) {
+        wallIntegral += wallError * dt;
+      }
+      wallIntegral = constrain(wallIntegral, -WALL_INTEGRAL_MAX, WALL_INTEGRAL_MAX);
+      float iTerm = KI_WALL * wallIntegral;
+
+      // D term
+      float derivative = (wallError - lastWallError) / dt;
+      float dTerm = KD_WALL * derivative;
+      lastWallError = wallError;
+
+      steerCorrection = pTerm + iTerm + dTerm;
+    } else {
+      // Wall not visible — drive straight, don't correct
+      steerCorrection = 0.0;
+      wallIntegral = 0.0;
+      lastWallError = 0.0;
     }
-    backward(motorSpeed);
+
+    // Apply steering correction to target speeds
+    // steerCorrection > 0 (too far from wall) → left slower, right faster → steer left
+    // steerCorrection < 0 (too close to wall) → left faster, right slower → steer right
+    targetLeftSpeed  = WALL_FOLLOW_BASE_SPEED_PPS - steerCorrection;
+    targetRightSpeed = WALL_FOLLOW_BASE_SPEED_PPS + steerCorrection;
   }
 
-  // Print PID debug info
-  Serial.print("Dist: "); Serial.print(distance);
-  Serial.print(" | Err: "); Serial.print(error);
-  Serial.print(" | P: "); Serial.print(pTerm);
-  Serial.print(" | I: "); Serial.print(iTerm);
-  Serial.print(" | D: "); Serial.print(dTerm);
-  Serial.print(" | Out: "); Serial.print(output);
-  Serial.print(" | PWM: "); Serial.println(motorSpeed);
+  // --- Step 5: Update encoder speeds ---
+  updateEncoderSpeeds();
+
+  float leftActualSpeed = leftSpeedpps * leftMotorDir;
+  float rightActualSpeed = rightSpeedpps * rightMotorDir;
+
+  // --- Step 6: Per-wheel Speed PID (inner loop) ---
+  float leftPIDOut = speedPID(targetLeftSpeed, leftActualSpeed,
+                              leftSpeedIntegral, lastLeftSpeedError, dt);
+  float rightPIDOut = speedPID(targetRightSpeed, rightActualSpeed,
+                               rightSpeedIntegral, lastRightSpeedError, dt);
+
+  leftPWM = constrain((int)leftPIDOut, -255, 255);
+  rightPWM = constrain((int)rightPIDOut, -255, 255);
+
+  // MIN_SPEED kickstart
+  if (leftPWM > 0 && leftPWM < MIN_SPEED) leftPWM = MIN_SPEED;
+  if (leftPWM < 0 && leftPWM > -MIN_SPEED) leftPWM = -MIN_SPEED;
+  if (rightPWM > 0 && rightPWM < MIN_SPEED) rightPWM = MIN_SPEED;
+  if (rightPWM < 0 && rightPWM > -MIN_SPEED) rightPWM = -MIN_SPEED;
+
+  // --- Step 7: Apply PWM to motors ---
+  setWheels(leftPWM, rightPWM);
+
+  // --- Debug output ---
+  Serial.print("Front: ");
+  Serial.print(frontDist);
+  Serial.print(" | Left: ");
+  Serial.print(leftDist);
+  Serial.print(" | TgtL: ");
+  Serial.print(targetLeftSpeed);
+  Serial.print(" TgtR: ");
+  Serial.print(targetRightSpeed);
+  Serial.print(" | ActL: ");
+  Serial.print(leftActualSpeed);
+  Serial.print(" ActR: ");
+  Serial.print(rightActualSpeed);
+  Serial.print(" | PWM L: ");
+  Serial.print(leftPWM);
+  Serial.print(" R: ");
+  Serial.println(rightPWM);
 }
 
-// ---------- Serial commands ----------
+// =====================================================================
+// MANUAL MODE: Encoder-based straight-line correction
+// =====================================================================
+void manualStraightCorrection(int baseSpeed) {
+  if (leftMotorDir == 0 || rightMotorDir == 0) return;
+  if (leftMotorDir != rightMotorDir) return;
+
+  updateEncoderSpeeds();
+  if (leftSpeedpps < 1 && rightSpeedpps < 1) return;
+
+  float speedDiff = leftSpeedpps - rightSpeedpps;
+  int correction = (int)(speedDiff * STRAIGHT_CORRECTION_GAIN);
+  correction = constrain(correction, -30, 30);
+
+  int newLeft = baseSpeed - correction;
+  int newRight = baseSpeed + correction;
+
+  if (baseSpeed > 0) {
+    newLeft = max(newLeft, 0);
+    newRight = max(newRight, 0);
+  } else {
+    newLeft = min(newLeft, 0);
+    newRight = min(newRight, 0);
+  }
+
+  setWheels(newLeft, newRight);
+}
+
+// =====================================================================
+// SERIAL COMMANDS
+// =====================================================================
 void handleCommand(char c) {
 
   // Space always stops the robot
   if (c == ' ') {
-    followMode = false;
+    wallFollowMode = false;
     stopRobot();
-    // Reset PID state when leaving follow mode
-    integral = 0.0;
-    lastError = 0.0;
     Serial.println("STOPPED");
     return;
   }
 
-  // Activate automatic mode
+  // Activate wall-following mode
   if (c == 'f') {
-    followMode = true;
+    wallFollowMode = true;
     stopRobot();
-    // Reset PID state when entering follow mode
-    integral = 0.0;
-    lastError = 0.0;
     lastPidTime = millis();
-    Serial.println("Follow Me mode ON (PID)");
+    lastSpeedCalcTime = millis();
+    Serial.println("Wall-following mode ON");
     return;
   }
 
   // Return to manual mode
   if (c == 'm') {
-    followMode = false;
+    wallFollowMode = false;
     stopRobot();
-    integral = 0.0;
-    lastError = 0.0;
-    Serial.println("Manual mode ON");
+    Serial.println("Manual mode ON (encoder-corrected)");
     return;
   }
 
-  // Ignore movement commands during auto mode
-  if (followMode) {
+  // Ignore movement commands during wall-follow mode
+  if (wallFollowMode) {
     Serial.println("Press m for manual mode");
     return;
   }
 
-  // FIX #5: Record the time of every valid manual command
-  // so the main loop can auto-stop after MANUAL_TIMEOUT ms
   lastCommandTime = millis();
 
   switch (c) {
@@ -315,11 +502,9 @@ void handleCommand(char c) {
     case 'd': turnRight(speedSetting); break;
     case 'q': spinLeft(speedSetting); break;
     case 'e': spinRight(speedSetting); break;
-
     case '+':
       speedSetting = min(speedSetting + 10, 255);
       break;
-
     case '-':
       speedSetting = max(speedSetting - 10, 0);
       break;
@@ -328,33 +513,72 @@ void handleCommand(char c) {
   Serial.print("Command: ");
   Serial.print(c);
   Serial.print(" | Speed: ");
-  Serial.println(speedSetting);
+  Serial.print(speedSetting);
+  Serial.print(" | L_enc: ");
+  Serial.print(leftEncoderCount);
+  Serial.print(" R_enc: ");
+  Serial.println(rightEncoderCount);
 }
 
-// ---------- Setup ----------
+// =====================================================================
+// SETUP
+// =====================================================================
 void setup() {
   Serial.begin(9600);
 
+  // Motor pins
   pinMode(LEFT_EN, OUTPUT);
   pinMode(LEFT_IN1, OUTPUT);
   pinMode(LEFT_IN2, OUTPUT);
   pinMode(RIGHT_EN, OUTPUT);
   pinMode(RIGHT_IN1, OUTPUT);
   pinMode(RIGHT_IN2, OUTPUT);
-  pinMode(TRIG_PIN, OUTPUT);
-  pinMode(ECHO_PIN, INPUT);
+
+  // Ultrasonic sensor pins
+  pinMode(FRONT_TRIG, OUTPUT);
+  pinMode(FRONT_ECHO, INPUT);
+  pinMode(LEFT_TRIG, OUTPUT);
+  pinMode(LEFT_ECHO, INPUT);
+
+  // Encoder pins with pull-up resistors
+  pinMode(LEFT_ENCODER_PIN, INPUT_PULLUP);
+  pinMode(RIGHT_ENCODER_PIN, INPUT_PULLUP);
+
+  // Attach encoder interrupts
+  attachInterrupt(digitalPinToInterrupt(LEFT_ENCODER_PIN), leftEncoderISR, FALLING);
+  attachInterrupt(digitalPinToInterrupt(RIGHT_ENCODER_PIN), rightEncoderISR, FALLING);
 
   stopRobot();
 
-  Serial.println("Robot ready! (PID version)");
-  Serial.println("f = Follow Me mode (PID)");
-  Serial.println("m = Manual mode");
+  Serial.println("========================================");
+  Serial.println("Robot ready! V4 (Wall-following)");
+  Serial.println("========================================");
+  Serial.println("f = Wall-following mode");
+  Serial.println("m = Manual mode (encoder-corrected)");
   Serial.println("space = Stop");
   Serial.println("w/s/a/d/q/e = Movement");
   Serial.println("+/- = Adjust speed");
+  Serial.println("----------------------------------------");
+  Serial.print("Front sensor: TRIG=");
+  Serial.print(FRONT_TRIG);
+  Serial.print(" ECHO=");
+  Serial.println(FRONT_ECHO);
+  Serial.print("Left sensor:  TRIG=");
+  Serial.print(LEFT_TRIG);
+  Serial.print(" ECHO=");
+  Serial.println(LEFT_ECHO);
+  Serial.print("Wall set point: ");
+  Serial.print(WALL_SET_POINT);
+  Serial.println(" cm");
+  Serial.print("Front threshold: ");
+  Serial.print(FRONT_THRESHOLD);
+  Serial.println(" cm");
+  Serial.println("========================================");
 }
 
-// ---------- Main loop ----------
+// =====================================================================
+// MAIN LOOP
+// =====================================================================
 void loop() {
 
   // Read serial commands
@@ -365,23 +589,28 @@ void loop() {
     }
   }
 
-  // FIX #3: Non-blocking timing instead of delay(100).
-  // The loop runs continuously, so serial commands are processed
-  // immediately even while in follow mode.
-  if (followMode) {
+  // --- Wall-following mode: run cascaded PID at regular intervals ---
+  if (wallFollowMode) {
     unsigned long now = millis();
     if (now - lastFollowTime >= FOLLOW_INTERVAL) {
       lastFollowTime = now;
-      followObject();
+      wallFollow();
     }
   }
 
-  // FIX #5: Auto-stop in manual mode if no command received recently.
-  // This makes manual control feel more like a joystick — the robot
-  // only moves while you're actively sending commands.
+  // --- Manual mode: auto-stop + straight-line correction ---
   else {
     if (millis() - lastCommandTime > MANUAL_TIMEOUT) {
       stopRobot();
+    }
+    else if (leftMotorDir != 0 && rightMotorDir != 0 && leftMotorDir == rightMotorDir) {
+      if (millis() - lastSpeedCalcTime >= SPEED_CALC_INTERVAL) {
+        if (leftMotorDir > 0) {
+          manualStraightCorrection(speedSetting);
+        } else {
+          manualStraightCorrection(-speedSetting);
+        }
+      }
     }
   }
 }
